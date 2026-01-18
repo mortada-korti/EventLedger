@@ -95,7 +95,7 @@ contract EventTicketing {
             }
         }
 
-        require(canRefund, "Refund not allowed (Time limit passed and not canceled)");
+        require(canRefund, "Refund not allowed (Time limit passed)");
 
         uint256 refundAmount = userTicketCount * myEvent.price;
         
