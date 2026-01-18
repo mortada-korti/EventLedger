@@ -55,6 +55,15 @@ export default function Home() {
     const timer = setInterval(() => setCurrentTime(Date.now()), 60000); // Update every minute
     if (typeof window !== 'undefined' && !window.ethereum) {
       setIsMetaMaskMissing(true);
+    } else {
+      // Auto-connect if already authorized
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      provider.send("eth_accounts", []).then((accounts) => {
+        if (accounts.length > 0) {
+          setAccount(accounts[0]);
+          provider.getBalance(accounts[0]).then(bal => setBalance(ethers.formatEther(bal)));
+        }
+      });
     }
     return () => clearInterval(timer);
   }, []);
@@ -76,6 +85,21 @@ export default function Home() {
   useEffect(() => {
     if (account) {
       updateContractSigner();
+
+      // Setup real-time balance listener
+      if (window.ethereum) {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        const updateBalance = (blockNumber) => {
+          provider.getBalance(account).then(bal => setBalance(ethers.formatEther(bal)));
+        };
+
+        provider.on("block", updateBalance);
+
+        // Cleanup listener when account changes or component unmounts
+        return () => {
+          provider.off("block", updateBalance);
+        };
+      }
     }
   }, [account]);
 
@@ -218,6 +242,14 @@ export default function Home() {
     try {
       const priceInWei = ethers.parseEther(price.toString());
       const totalWei = priceInWei * BigInt(quantity);
+
+      // Check for sufficient balance
+      const currentBalanceWei = ethers.parseEther(balance);
+      if (totalWei > currentBalanceWei) {
+        showNotification("Insufficient funds to complete this purchase.", "error");
+        return;
+      }
+
       const tx = await contract.buyTicket(eventId, quantity, { value: totalWei });
       await tx.wait();
       showNotification(`Successfully bought ${quantity} ticket(s)!`, "success");
@@ -479,6 +511,19 @@ export default function Home() {
                 <h3>{event.title}</h3>
                 <p>📅 Start: {event.date}</p>
                 <p>🏁 End: {event.endDate}</p>
+                {new Date().getTime() / 1000 > event.rawEndDate && (
+                  <div style={{
+                    background: 'var(--error)',
+                    color: 'white',
+                    padding: '0.5rem',
+                    borderRadius: '0.5rem',
+                    textAlign: 'center',
+                    fontWeight: 'bold',
+                    margin: '1rem 0'
+                  }}>
+                    ⚠️ EXPIRED / INVALID
+                  </div>
+                )}
                 <div style={{ margin: '1rem 0', padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: '0.5rem' }}>
                   <p style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <span>Unit Price:</span>
