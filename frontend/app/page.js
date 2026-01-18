@@ -56,14 +56,17 @@ export default function Home() {
     if (typeof window !== 'undefined' && !window.ethereum) {
       setIsMetaMaskMissing(true);
     } else {
-      // Auto-connect if already authorized
-      const provider = new ethers.BrowserProvider(window.ethereum);
-      provider.send("eth_accounts", []).then((accounts) => {
-        if (accounts.length > 0) {
-          setAccount(accounts[0]);
-          provider.getBalance(accounts[0]).then(bal => setBalance(ethers.formatEther(bal)));
-        }
-      });
+      // Auto-connect if already authorized and not explicitly disconnected
+      const isDisconnected = localStorage.getItem('walletIsDisconnected') === 'true';
+      if (!isDisconnected) {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        provider.send("eth_accounts", []).then((accounts) => {
+          if (accounts.length > 0) {
+            setAccount(accounts[0]);
+            provider.getBalance(accounts[0]).then(bal => setBalance(ethers.formatEther(bal)));
+          }
+        });
+      }
     }
     return () => clearInterval(timer);
   }, []);
@@ -119,6 +122,7 @@ export default function Home() {
 
   async function connectWallet() {
     if (!window.ethereum) return alert("Install Metamask!");
+    localStorage.removeItem('walletIsDisconnected');
     const provider = new ethers.BrowserProvider(window.ethereum);
     const accounts = await provider.send("eth_requestAccounts", []);
     setAccount(accounts[0]);
@@ -366,7 +370,10 @@ export default function Home() {
           <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
             <span style={{ fontWeight: 'bold', color: 'var(--success)' }}>{Number(balance).toFixed(4)} GO</span>
             <span>{account.slice(0, 6)}...{account.slice(-4)}</span>
-            <button onClick={() => window.location.reload()}>Disconnect</button>
+            <button onClick={() => {
+              localStorage.setItem('walletIsDisconnected', 'true');
+              window.location.reload();
+            }}>Disconnect</button>
           </div>
         )}
       </header>
