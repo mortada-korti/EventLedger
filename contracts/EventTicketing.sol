@@ -56,7 +56,7 @@ contract EventTicketing {
 
     function buyTicket(uint256 _eventId, uint256 _quantity) external payable {
         Event storage myEvent = events[_eventId];
-        require(myEvent.date > block.timestamp, "Event has passed");
+        require(myEvent.endDate > block.timestamp, "Event has ended");
         require(!myEvent.isCanceled, "Event is canceled");
         require(myEvent.soldCount + _quantity <= myEvent.capacity, "Not enough tickets left");
         require(msg.value == myEvent.price * _quantity, "Incorrect Ether sent");
@@ -125,5 +125,13 @@ contract EventTicketing {
         require(success, "Transfer failed");
 
         emit FundsWithdrawn(_eventId, msg.sender, amount);
+    }
+
+    function getAllEvents() external view returns (Event[] memory) {
+        Event[] memory allEvents = new Event[](nextEventId);
+        for (uint256 i = 0; i < nextEventId; i++) {
+            allEvents[i] = events[i];
+        }
+        return allEvents;
     }
 }

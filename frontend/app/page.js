@@ -9,9 +9,23 @@ export default function Home() {
   const [events, setEvents] = useState([]);
   const [myTickets, setMyTickets] = useState({});
   const [loading, setLoading] = useState(false);
-  const [activeTab, setActiveTab] = useState('events'); // events, create, tickets
+  const [activeTab, setActiveTabState] = useState('events');
   const [balance, setBalance] = useState("0");
   const [ticketQuantities, setTicketQuantities] = useState({}); // eventId -> quantity
+  const [refundedTickets, setRefundedTickets] = useState(new Set());
+
+  useEffect(() => {
+    // Restore tab from session storage
+    const savedTab = sessionStorage.getItem('activeTab');
+    if (savedTab) {
+      setActiveTabState(savedTab);
+    }
+  }, []);
+
+  const setActiveTab = (tab) => {
+    setActiveTabState(tab);
+    sessionStorage.setItem('activeTab', tab);
+  };
 
   // Create Event Form
   const [form, setForm] = useState({ title: '', price: '0', date: '', endDate: '', capacity: '100' });
@@ -24,6 +38,12 @@ export default function Home() {
     setNotification({ message, type });
     setTimeout(() => setIsExiting(true), 4500);
     setTimeout(() => setNotification(null), 4900);
+  };
+
+  // Helper for Local ISO String (Fixes Timezone/UTC issues for inputs)
+  const toLocalISOString = (date) => {
+    const offset = date.getTimezoneOffset() * 60000; // Offset in ms
+    return (new Date(date.getTime() - offset)).toISOString().slice(0, 16);
   };
 
   const handleError = (err) => {
@@ -52,13 +72,13 @@ export default function Home() {
   const [isMetaMaskMissing, setIsMetaMaskMissing] = useState(false);
 
   useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(Date.now()), 60000); // Update every minute
+    const timer = setInterval(() => setCurrentTime(Date.now()), 1000); // Update every second
     if (typeof window !== 'undefined' && !window.ethereum) {
       setIsMetaMaskMissing(true);
     } else {
-      // Auto-connect if already authorized and not explicitly disconnected
-      const isDisconnected = localStorage.getItem('walletIsDisconnected') === 'true';
-      if (!isDisconnected) {
+      // Auto-connect ONLY if previously connected in this session
+      const isConnectedInSession = sessionStorage.getItem('isWalletConnected') === 'true';
+      if (isConnectedInSession) {
         const provider = new ethers.BrowserProvider(window.ethereum);
         provider.send("eth_accounts", []).then((accounts) => {
           if (accounts.length > 0) {
@@ -103,6 +123,12 @@ export default function Home() {
           provider.off("block", updateBalance);
         };
       }
+    } else {
+      // User disconnected
+      setActiveTab('events');
+      setForm({ title: '', price: '0', date: '', endDate: '', capacity: '100' });
+      setMyTickets({});
+      // Optional: clear other user-specific state
     }
   }, [account]);
 
@@ -122,10 +148,11 @@ export default function Home() {
 
   async function connectWallet() {
     if (!window.ethereum) return alert("Install Metamask!");
-    localStorage.removeItem('walletIsDisconnected');
     const provider = new ethers.BrowserProvider(window.ethereum);
     const accounts = await provider.send("eth_requestAccounts", []);
+
     setAccount(accounts[0]);
+    sessionStorage.setItem('isWalletConnected', 'true');
 
     const bal = await provider.getBalance(accounts[0]);
     setBalance(ethers.formatEther(bal));
@@ -137,13 +164,9 @@ export default function Home() {
     if (!contract) return;
     setLoading(true);
     try {
-      const nextId = await contract.nextEventId();
-      const loadedEvents = [];
-      const ticketsOwned = {};
-
-      for (let i = 0; i < Number(nextId); i++) {
-        const e = await contract.events(i);
-        loadedEvents.push({
+      const allEvents = await contract.getAllEvents();
+      const loadedEvents = await Promise.all(allEvents.map(async (e, i) => {
+        return {
           id: i,
           organizer: e.organizer,
           title: e.title,
@@ -156,11 +179,25 @@ export default function Home() {
           soldCount: Number(e.soldCount),
           isCanceled: e.isCanceled,
           fundsWithdrawn: e.fundsWithdrawn
-        });
+        };
+      }));
 
-        const count = await contract.tickets(i, account);
-        if (Number(count) > 0) ticketsOwned[i] = Number(count);
+      // Load tickets owned in parallel
+      const ticketsOwned = {};
+      for (const e of loadedEvents) {
+        const count = await contract.tickets(e.id, account);
+        if (Number(count) > 0) ticketsOwned[e.id] = Number(count);
       }
+
+
+
+
+      // Fetch Refund logs to track history even if balance is 0
+      const refundFilter = contract.filters.RefundIssued(null, account);
+      const refundLogs = await contract.queryFilter(refundFilter);
+      const refundedIds = new Set(refundLogs.map(log => Number(log.args[0]))); // eventId is arg 0
+      setRefundedTickets(refundedIds);
+
       setEvents(loadedEvents);
       setMyTickets(ticketsOwned);
     } catch (err) {
@@ -171,7 +208,13 @@ export default function Home() {
   }
 
   async function createEvent() {
-    if (!contract) return;
+    // Verify signer matches active account
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    const signer = await provider.getSigner();
+    if (signer.address.toLowerCase() !== account.toLowerCase()) {
+      showNotification(`Wallet Mismatch! Expected: ${account.slice(0, 6)}... Got: ${signer.address.slice(0, 6)}...`, "error");
+      return;
+    }
 
     const newErrors = {};
     if (!form.title) newErrors.title = "Title is required";
@@ -235,7 +278,13 @@ export default function Home() {
   }
 
   async function buyTicket(eventId, price, quantity = 1) {
-    if (!contract) return;
+    // Verify signer matches active account
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    const signer = await provider.getSigner();
+    if (signer.address.toLowerCase() !== account.toLowerCase()) {
+      showNotification(`Wallet Mismatch! Expected: ${account.slice(0, 6)}... Got: ${signer.address.slice(0, 6)}...`, "error");
+      return;
+    }
 
     const event = events.find(e => e.id === eventId);
     if (event && quantity > (event.capacity - event.soldCount)) {
@@ -243,9 +292,12 @@ export default function Home() {
       return;
     }
 
+    console.log(`[DEBUG] Attempting to buy:`, { eventId, price, quantity });
+
     try {
       const priceInWei = ethers.parseEther(price.toString());
       const totalWei = priceInWei * BigInt(quantity);
+      console.log(`[DEBUG] Calculated Cost:`, { priceInWei: priceInWei.toString(), totalWei: totalWei.toString() });
 
       // Check for sufficient balance
       const currentBalanceWei = ethers.parseEther(balance);
@@ -274,7 +326,13 @@ export default function Home() {
   }
 
   async function requestRefund(eventId) {
-    if (!contract) return;
+    // Verify signer matches active account
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    const signer = await provider.getSigner();
+    if (signer.address.toLowerCase() !== account.toLowerCase()) {
+      showNotification(`Wallet Mismatch! Expected: ${account.slice(0, 6)}... Got: ${signer.address.slice(0, 6)}...`, "error");
+      return;
+    }
     try {
       const tx = await contract.requestRefund(eventId);
       await tx.wait();
@@ -286,7 +344,25 @@ export default function Home() {
   }
 
   async function cancelEvent(eventId) {
-    if (!contract) return;
+    // Verify signer matches active account
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    const signer = await provider.getSigner();
+    if (signer.address.toLowerCase() !== account.toLowerCase()) {
+      showNotification(`Wallet Mismatch! Expected: ${account.slice(0, 6)}... Got: ${signer.address.slice(0, 6)}...`, "error");
+      return;
+    }
+
+    // Double check ownership before transaction to obtain clear error
+    try {
+      const e = await contract.events(eventId);
+      if (e.organizer.toLowerCase() !== account.toLowerCase()) {
+        showNotification(`You are not the organizer. Organizer: ${e.organizer.slice(0, 6)}...`, "error");
+        return;
+      }
+    } catch (err) {
+      console.error("Error checking ownership:", err);
+    }
+
     try {
       const tx = await contract.cancelEvent(eventId);
       await tx.wait();
@@ -305,9 +381,35 @@ export default function Home() {
   async function withdrawFunds(eventId) {
     if (!contract) return;
     try {
+      const event = events.find(e => e.id === eventId);
+
+      // Check local time before sending tx (Contract will enforce strict block time)
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      if (nowSeconds <= event.rawEndDate) {
+        showNotification(`Event hasn't ended yet (Local Time). Diff: ${event.rawEndDate - nowSeconds}s.`, "error");
+        return;
+      }
+
+      const amount = Number(event.soldCount) * Number(event.price);
+      console.log(`Withdrawing for Event ${eventId}. Sold: ${event.soldCount}, Price: ${event.price}, Total: ${amount}`);
+      console.log(`Balance Before Withdraw: ${balance}`);
+
       const tx = await contract.withdrawFunds(eventId);
-      await tx.wait();
-      showNotification("Funds Withdrawn successfully!", "success");
+      console.log("Withdraw Transaction Sent:", tx.hash);
+
+      const receipt = await tx.wait();
+      console.log("Withdraw Confirmed. Gas Used:", receipt.fee ? ethers.formatEther(receipt.fee) : "Unknown");
+
+      showNotification(`Funds Withdrawn successfully! (+${amount.toFixed(4)} GO)`, "success");
+
+      // Force immediate balance refresh
+      if (account && window.ethereum) {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        const bal = await provider.getBalance(account);
+        const newBal = ethers.formatEther(bal);
+        setBalance(newBal);
+        console.log(`Balance After Withdraw: ${newBal}`);
+      }
       loadEvents();
     } catch (err) {
       handleError(err);
@@ -317,7 +419,7 @@ export default function Home() {
   const getEventStatus = (event) => {
     if (event.isCanceled) return { label: 'CANCELED', class: 'badge-red' };
 
-    const now = new Date().getTime() / 1000;
+    const now = currentTime / 1000;
 
     // Check Ended
     if (now > event.rawEndDate) return { label: 'ENDED', class: 'badge-gray' };
@@ -368,10 +470,14 @@ export default function Home() {
           <button onClick={connectWallet}>Connect Wallet</button>
         ) : (
           <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
-            <span style={{ fontWeight: 'bold', color: 'var(--success)' }}>{Number(balance).toFixed(4)} GO</span>
-            <span>{account.slice(0, 6)}...{account.slice(-4)}</span>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', lineHeight: '1.2' }}>
+              <span style={{ fontWeight: 'bold', color: 'var(--success)', fontSize: '1.1rem' }}>{Number(balance).toFixed(4)} GO</span>
+              <span style={{ fontSize: '0.8rem', opacity: 0.8, background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>
+                Account: {account.slice(0, 6)}...{account.slice(-4)}
+              </span>
+            </div>
             <button onClick={() => {
-              localStorage.setItem('walletIsDisconnected', 'true');
+              sessionStorage.removeItem('isWalletConnected');
               window.location.reload();
             }}>Disconnect</button>
           </div>
@@ -420,7 +526,7 @@ export default function Home() {
               <input
                 type="datetime-local"
                 value={form.date}
-                min={new Date().toISOString().slice(0, 16)}
+                min={toLocalISOString(new Date())}
                 max="9999-12-31T23:59"
                 onChange={e => handleChange('date', e.target.value)}
                 style={{ border: errors.date ? '1px solid var(--error)' : undefined }}
@@ -433,7 +539,7 @@ export default function Home() {
               <input
                 type="datetime-local"
                 value={form.endDate}
-                min={form.date || new Date().toISOString().slice(0, 16)}
+                min={form.date || toLocalISOString(new Date())}
                 max="9999-12-31T23:59"
                 onChange={e => handleChange('endDate', e.target.value)}
                 style={{ border: errors.endDate ? '1px solid var(--error)' : undefined }}
@@ -473,7 +579,7 @@ export default function Home() {
                 <p>🎟️ {event.soldCount} / {event.capacity} Sold</p>
                 <p style={{ fontSize: '0.8rem', color: '#aaa' }}>Organizer: {event.organizer.slice(0, 6)}...</p>
 
-                {!event.isCanceled && event.soldCount < event.capacity && new Date().getTime() / 1000 < event.rawDate && (
+                {!event.isCanceled && event.soldCount < event.capacity && currentTime / 1000 < event.rawEndDate && (account && event.organizer.toLowerCase() !== account.toLowerCase()) && (
                   <div style={{ marginTop: '1rem' }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
                       <label style={{ fontSize: '0.9rem' }}>Qty:</label>
@@ -494,10 +600,10 @@ export default function Home() {
 
                 {event.organizer.toLowerCase() === account?.toLowerCase() && (
                   <div style={{ marginTop: '1rem', display: 'flex', gap: '0.5rem' }}>
-                    {!event.isCanceled && !event.fundsWithdrawn && new Date().getTime() / 1000 < event.rawDate && (
+                    {!event.isCanceled && !event.fundsWithdrawn && currentTime / 1000 < event.rawDate && (
                       <button onClick={() => cancelEvent(event.id)} style={{ background: 'var(--error)', fontSize: '0.8rem' }}>Cancel</button>
                     )}
-                    {new Date().getTime() / 1000 > event.rawEndDate && !event.fundsWithdrawn && !event.isCanceled && event.soldCount > 0 && (
+                    {currentTime / 1000 > event.rawEndDate && !event.fundsWithdrawn && !event.isCanceled && event.soldCount > 0 && (
                       <button onClick={() => withdrawFunds(event.id)} style={{ background: 'var(--success)', fontSize: '0.8rem' }}>Withdraw</button>
                     )}
                   </div>
@@ -513,48 +619,59 @@ export default function Home() {
 
         {activeTab === 'tickets' && (
           <div className="grid">
-            {events.filter(e => myTickets[e.id]).map(event => (
-              <div key={event.id} className="glass-card">
-                <h3>{event.title}</h3>
-                <p>📅 Start: {event.date}</p>
-                <p>🏁 End: {event.endDate}</p>
-                {new Date().getTime() / 1000 > event.rawEndDate && (
-                  <div style={{
-                    background: 'var(--error)',
-                    color: 'white',
-                    padding: '0.5rem',
-                    borderRadius: '0.5rem',
-                    textAlign: 'center',
-                    fontWeight: 'bold',
-                    margin: '1rem 0'
-                  }}>
-                    ⚠️ EXPIRED / INVALID
-                  </div>
-                )}
-                <div style={{ margin: '1rem 0', padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: '0.5rem' }}>
-                  <p style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span>Unit Price:</span>
-                    <span>{event.price} GO</span>
-                  </p>
-                  <p style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 'bold' }}>
-                    <span>Quantity:</span>
-                    <span>{myTickets[event.id]}</span>
-                  </p>
-                  <hr style={{ borderColor: 'rgba(255,255,255,0.1)' }} />
-                  <p style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--success)', fontSize: '1.1rem' }}>
-                    <span>Total Value:</span>
-                    <span>{(Number(event.price) * myTickets[event.id]).toFixed(4)} GO</span>
-                  </p>
-                </div>
+            {events.filter(e => myTickets[e.id] || refundedTickets.has(e.id)).map(event => {
+              let ticketStatus = { label: 'VALID', class: 'badge-green', color: 'var(--success)' };
+              const nowSeconds = Date.now() / 1000;
 
-                {(event.isCanceled || (new Date().getTime() / 1000 < event.rawDate - 86400)) && (
-                  <button onClick={() => requestRefund(event.id)} style={{ marginTop: '1rem', width: '100%', background: 'var(--accent)' }}>
-                    Request Refund 💸
-                  </button>
-                )}
-              </div>
-            ))}
-            {Object.keys(myTickets).length === 0 && <p>No tickets owned.</p>}
+              if (event.isCanceled || refundedTickets.has(event.id)) {
+                ticketStatus = { label: 'INVALID', class: 'badge-red', color: 'var(--error)' };
+              } else if (nowSeconds > event.rawEndDate) {
+                ticketStatus = { label: 'EXPIRED', class: 'badge-gray', color: '#999' };
+              }
+
+              return (
+                <div key={event.id} className="glass-card">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <h3>{event.title}</h3>
+                    <span style={{
+                      padding: '4px 8px',
+                      borderRadius: '4px',
+                      fontSize: '0.8rem',
+                      fontWeight: 'bold',
+                      background: ticketStatus.color,
+                      color: 'white'
+                    }}>
+                      {ticketStatus.label}
+                    </span>
+                  </div>
+                  <p>📅 Start: {event.date}</p>
+                  <p>🏁 End: {event.endDate}</p>
+
+                  <div style={{ margin: '1rem 0', padding: '1rem', background: 'rgba(0,0,0,0.2)', borderRadius: '0.5rem' }}>
+                    <p style={{ display: 'flex', justifyContent: 'space-between' }}>
+                      <span>Unit Price:</span>
+                      <span>{event.price} GO</span>
+                    </p>
+                    <p style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 'bold' }}>
+                      <span>Quantity:</span>
+                      <span>{myTickets[event.id] || 0}</span>
+                    </p>
+                    <hr style={{ borderColor: 'rgba(255,255,255,0.1)' }} />
+                    <p style={{ display: 'flex', justifyContent: 'space-between', color: 'var(--success)', fontSize: '1.1rem' }}>
+                      <span>Total Value:</span>
+                      <span>{(Number(event.price) * (myTickets[event.id] || 0)).toFixed(4)} GO</span>
+                    </p>
+                  </div>
+
+                  {(!refundedTickets.has(event.id) && (event.isCanceled || (currentTime / 1000 < event.rawDate - 86400))) && (
+                    <button onClick={() => requestRefund(event.id)} style={{ marginTop: '1rem', width: '100%', background: 'var(--accent)' }}>
+                      Request Refund 💸
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+            {Object.keys(myTickets).length === 0 && refundedTickets.size === 0 && <p>No tickets owned.</p>}
           </div>
         )}
       </main>
