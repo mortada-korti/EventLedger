@@ -73,7 +73,6 @@ contract EventTicketing {
         require(msg.sender == myEvent.organizer, "Only organizer can cancel");
         require(!myEvent.isCanceled, "Event already canceled");
         require(myEvent.date > block.timestamp, "Event has already started");
-        // We allow canceling even if past date? Likely yes, to unblock refunds if it never happened.
 
         myEvent.isCanceled = true;
         emit EventCanceled(_eventId);
