@@ -91,4 +91,4 @@ npx hardhat test
 ```
 
 ## Demo
-![Demo video](demo-iob.mp4)
+[▶ Watch the demo](https://youtu.be/RP-U78SMy8Q)
