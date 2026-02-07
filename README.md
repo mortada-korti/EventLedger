@@ -89,3 +89,6 @@ To run the smart contract tests:
 ```bash
 npx hardhat test
 ```
+
+## Demo
+![Demo video](demo-iob.mp4)
